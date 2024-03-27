@@ -181,6 +181,8 @@ export class FirebaseAdapter implements IDatabaseAdapter {
   }
 
   dispose(): void {
+    this._zombie = true;
+
     if (!this._ready) {
       this.on(FirebaseAdapterEvent.Ready, () => {
         this.dispose();
@@ -197,7 +199,6 @@ export class FirebaseAdapter implements IDatabaseAdapter {
     this._databaseRef = null;
     this._userRef = null;
     this._document = null;
-    this._zombie = true;
   }
 
   getDocument(): ITextOperation | null {
@@ -255,25 +256,29 @@ export class FirebaseAdapter implements IDatabaseAdapter {
    */
   protected _monitorHistory(): void {
     // Get the latest checkpoint as a starting point so we don't have to re-play entire history.
-    this._databaseRef!.child("checkpoint").once("value", (snapshot) => {
-      if (this._zombie) {
-        // just in case we were cleaned up before we got the checkpoint data.
-        return;
-      }
+    this._databaseRef!.child("checkpoint")
+      .once("value", (snapshot) => {
+        if (this._zombie) {
+          // just in case we were cleaned up before we got the checkpoint data.
+          return;
+        }
 
-      const revisionId: string | null = snapshot.child("id").val();
-      const op: TextOperationType | null = snapshot.child("o").val();
-      const author: UserIDType | null = snapshot.child("a").val();
+        const revisionId: string | null = snapshot.child("id").val();
+        const op: TextOperationType | null = snapshot.child("o").val();
+        const author: UserIDType | null = snapshot.child("a").val();
 
-      if (op != null && revisionId != null && author !== null) {
-        this._pendingReceivedRevisions[revisionId] = { o: op, a: author };
-        this._checkpointRevision = this._revisionFromId(revisionId);
-        this._monitorHistoryStartingAt(this._checkpointRevision + 1);
-      } else {
-        this._checkpointRevision = 0;
-        this._monitorHistoryStartingAt(this._checkpointRevision);
-      }
-    });
+        if (op != null && revisionId != null && author !== null) {
+          this._pendingReceivedRevisions[revisionId] = { o: op, a: author };
+          this._checkpointRevision = this._revisionFromId(revisionId);
+          this._monitorHistoryStartingAt(this._checkpointRevision + 1);
+        } else {
+          this._checkpointRevision = 0;
+          this._monitorHistoryStartingAt(this._checkpointRevision);
+        }
+      })
+      .catch((err) => {
+        console.error("[firebase] Error getting checkpoint", err);
+      });
   }
 
   /**
@@ -305,9 +310,13 @@ export class FirebaseAdapter implements IDatabaseAdapter {
 
     this._firebaseOn(historyRef, "child_added", this._historyChildAdded, this);
 
-    historyRef.once("value", () => {
-      this._handleInitialRevisions();
-    });
+    historyRef
+      .once("value", () => {
+        this._handleInitialRevisions();
+      })
+      .catch((err) => {
+        console.error("[firebase] Error getting initial revisions", err);
+      });
   }
 
   /**
@@ -393,7 +402,19 @@ export class FirebaseAdapter implements IDatabaseAdapter {
           // We have an outstanding change at this revision id.
           if (
             this._sent.op.equals(revision.operation) &&
-            revision.author == this._userId
+            /**
+             * Adding the OR revisionId === "A0" condition because when firepad is
+             * initialized, both clients call Firepad.setText method which results
+             * in an operation being created for the default editor content of both the
+             * clients. If default editor content is same because of any code stub or
+             * if we have set some default value in monaco editor, this leads to the
+             * same default code appearing twice. To fix this, we make an assumption that
+             * if the sent op is same as received op and if it's the first op (A0), then
+             * it was probably a code stub. This condition will not hold true if both the
+             * clients input the same character after being initialized on purpose and want
+             * that content to be replicated twice. This however seems unlikely.
+             */
+            (revision.author == this._userId || revisionId === "A0")
           ) {
             // This is our change; it succeeded.
             if (this._revision % FirebaseAdapter.CHECKPOINT_FREQUENCY === 0) {
@@ -467,43 +488,52 @@ export class FirebaseAdapter implements IDatabaseAdapter {
     revisionData: FirebaseOperationDataType,
     callback: SendOperationCallbackType
   ): void {
-    this._databaseRef!.child("history")
-      .child(revisionId)
-      .transaction(
-        (current) => {
-          if (current === null) {
-            return revisionData;
-          }
-        },
-        (error, committed) => {
-          if (error) {
-            if (error.message === "disconnect") {
-              if (this._sent && this._sent.id === revisionId) {
-                // We haven't seen our transaction succeed or fail.  Send it again.
-                setTimeout(() => {
-                  this._doTransaction(revisionId, revisionData, callback);
-                });
-              }
-
-              return callback(error, false);
-            } else {
-              this._trigger(
-                FirebaseAdapterEvent.Error,
-                error,
-                revisionData.o.toString(),
-                {
-                  operation: revisionData.o.toString(),
-                  document: this._document!.toString(),
-                }
-              );
-              Utils.onFailedDatabaseTransaction(error.message);
+    try {
+      this._databaseRef!.child("history")
+        .child(revisionId)
+        .transaction(
+          (current) => {
+            if (current === null) {
+              return revisionData;
             }
-          }
+          },
+          (error, committed) => {
+            if (error) {
+              console.error("[firebase] Transaction error - onComplete", error);
 
-          return callback(null, committed);
-        },
-        false
-      );
+              if (error.message === "disconnect") {
+                if (this._sent && this._sent.id === revisionId) {
+                  // We haven't seen our transaction succeed or fail.  Send it again.
+                  setTimeout(() => {
+                    this._doTransaction(revisionId, revisionData, callback);
+                  });
+                }
+
+                return callback(error, false);
+              } else {
+                this._trigger(
+                  FirebaseAdapterEvent.Error,
+                  error,
+                  revisionData.o.toString(),
+                  {
+                    operation: revisionData.o.toString(),
+                    document: this._document!.toString(),
+                  }
+                );
+                Utils.onFailedDatabaseTransaction(error.message);
+              }
+            }
+
+            return callback(null, committed);
+          },
+          false
+        )
+        .catch((error) => {
+          console.error("[firebase] Transaction error - catch()", error);
+        });
+    } catch (error) {
+      console.error("[firebase] Transaction error - trycatch", error);
+    }
   }
 
   /**
@@ -538,12 +568,16 @@ export class FirebaseAdapter implements IDatabaseAdapter {
    * Updates current document state into `checkpoint` node in Firebase.
    */
   protected _saveCheckpoint(): void {
-    this._databaseRef!.child("checkpoint").set({
-      a: this._userId,
-      o: this._document!.toJSON(),
-      // use the id for the revision we just wrote.
-      id: this._revisionToId(this._revision - 1),
-    });
+    this._databaseRef!.child("checkpoint")
+      .set({
+        a: this._userId,
+        o: this._document!.toJSON(),
+        // use the id for the revision we just wrote.
+        id: this._revisionToId(this._revision - 1),
+      })
+      .catch((err) => {
+        console.error("[firebase] Error saving checkpoint", err);
+      });
   }
 
   isHistoryEmpty(): boolean {
